@@ -11,6 +11,8 @@ import {
     resolveS3Credentials,
     resolveWebDAVCredentials,
 } from '../../../utils/metadata/channelCredentials.js';
+import { dispatchToFunction } from '../../../utils/internalDispatch.js';
+import { onRequest as listOnRequest } from '../list.js';
 
 // CORS 跨域响应头
 const corsHeaders = {
@@ -42,11 +44,14 @@ export async function onRequest(context) {
                 const currentFolder = folderQueue.shift();
 
                 // 获取指定目录下的所有文件
+                // 进程内调用 list 处理器，避免同域回环 522
                 const listUrl = new URL(`${url.origin}/api/manage/list?count=-1&dir=${currentFolder.path}`);
-                const listRequest = new Request(listUrl, {
-                    headers: request.headers,
+                const listResponse = await dispatchToFunction(listOnRequest, {
+                    request: new Request(listUrl),
+                    env,
+                    waitUntil,
+                    params: {},
                 });
-                const listResponse = await fetch(listRequest);
                 const listData = await listResponse.json();
 
                 const files = listData.files;

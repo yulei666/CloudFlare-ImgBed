@@ -2,9 +2,14 @@
 import { fetchOthersConfig } from "../utils/sysConfig";
 import { getDatabase } from "../utils/databaseAdapter";
 import { createApiToken } from "../api/manage/apiTokens";
+import { dispatchToFunction, toCatchAllParams } from "../utils/internalDispatch.js";
+import { onRequest as listOnRequest } from "../api/manage/list.js";
+import { onRequest as uploadOnRequest } from "../upload/index.js";
+import { onRequest as fileOnRequest } from "../file/[[path]].js";
+import { onRequest as deleteOnRequest } from "../api/manage/delete/[[path]].js";
 
 export async function onRequest(context) {
-    const { request, env } = context;
+    const { request, env, waitUntil } = context;
 
     const authResponse = await checkAuth(request, env);
     if (authResponse) return authResponse;
@@ -16,10 +21,10 @@ export async function onRequest(context) {
 
     switch (modifiedRequest.method) {
         case 'OPTIONS': return handleOptions(modifiedRequest);
-        case 'PROPFIND': return handlePropfind(modifiedRequest, env);
-        case 'PUT': return handlePut(modifiedRequest, env);
-        case 'DELETE': return handleDelete(modifiedRequest, env);
-        case 'GET': return handleGet(modifiedRequest, env);
+        case 'PROPFIND': return handlePropfind(modifiedRequest, env, waitUntil);
+        case 'PUT': return handlePut(modifiedRequest, env, waitUntil);
+        case 'DELETE': return handleDelete(modifiedRequest, env, waitUntil);
+        case 'GET': return handleGet(modifiedRequest, env, waitUntil);
         case 'MKCOL': return new Response(null, { status: 201 });
         default: return new Response('Method Not Allowed', { status: 405 });
     }
@@ -103,13 +108,13 @@ function handleOptions(request) {
     });
 }
 
-async function handleGet(request, env) {
+async function handleGet(request, env, waitUntil) {
     const path = decodeURIComponent(new URL(request.url).pathname);
 
     if (path.endsWith('/')) { // Directory listing
         try {
             const dir = path === '/' ? '' : path.substring(1, path.length - 1);
-            const contents = await fetchDirectoryContents(dir, env, request);
+            const contents = await fetchDirectoryContents(dir, env, request, waitUntil);
             const html = generateDirectoryListingHtml(path, contents);
             return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
         } catch (error) {
@@ -120,7 +125,13 @@ async function handleGet(request, env) {
         try {
             const fileUrl = new URL(`/file${path}`, request.url);
 
-            const fileResponse = await fetch(fileUrl.toString());
+            // 进程内调用 /file 处理器，避免同域回环子请求（Cloudflare 会以 522 拒绝）
+            const fileResponse = await dispatchToFunction(fileOnRequest, {
+                request: new Request(fileUrl.toString()),
+                env,
+                waitUntil,
+                params: toCatchAllParams(path),
+            });
 
             if (!fileResponse.ok) {
                  return new Response('File not found', { status: fileResponse.status, statusText: fileResponse.statusText });
@@ -137,7 +148,7 @@ async function handleGet(request, env) {
     }
 }
 
-async function handlePut(request, env) {
+async function handlePut(request, env, waitUntil) {
     const fullPath = decodeURIComponent(new URL(request.url).pathname.substring(1));
     if (!fullPath || fullPath.endsWith('/')) {
         return new Response('Invalid file name', { status: 400 });
@@ -181,12 +192,18 @@ async function handlePut(request, env) {
     }
 
     try {
-        const response = await fetch(uploadUrl.toString(), { 
-            method: 'POST', 
-            body: formData,
-            headers: await getApiHeaders(env)
+        // 进程内调用 /upload 处理器（它会用内部 token 自行鉴权），避免同域回环 522
+        const response = await dispatchToFunction(uploadOnRequest, {
+            request: new Request(uploadUrl.toString(), {
+                method: 'POST',
+                body: formData,
+                headers: await getApiHeaders(env),
+            }),
+            env,
+            waitUntil,
+            params: {},
         });
-        const result = await response.json(); 
+        const result = await response.json();
         if (response.ok && Array.isArray(result) && result.length > 0 && result[0].src) {
             return new Response(null, { status: 201 }); // Created
         } else {
@@ -200,20 +217,26 @@ async function handlePut(request, env) {
     }
 }
 
-async function handleDelete(request, env) {
+async function handleDelete(request, env, waitUntil) {
     const path = decodeURIComponent(new URL(request.url).pathname.substring(1));
     if (!path) return new Response('Invalid path for DELETE', { status: 400 });
 
     const isFolder = path.endsWith('/');
     const cleanPath = isFolder ? path.slice(0, -1) : path;
-    
+
     const deleteUrl = new URL(`/api/manage/delete/${cleanPath}`, request.url);
     if (isFolder) deleteUrl.searchParams.set('folder', 'true');
 
     try {
-        const response = await fetch(deleteUrl.toString(), {
-            method: 'DELETE',
-            headers: await getApiHeaders(env)
+        // 进程内调用删除处理器，避免同域回环 522
+        const response = await dispatchToFunction(deleteOnRequest, {
+            request: new Request(deleteUrl.toString(), {
+                method: 'DELETE',
+                headers: await getApiHeaders(env),
+            }),
+            env,
+            waitUntil,
+            params: toCatchAllParams(cleanPath),
         });
         const result = await response.json();
         if (result.success) {
@@ -228,11 +251,11 @@ async function handleDelete(request, env) {
     }
 }
 
-async function handlePropfind(request, env) {
+async function handlePropfind(request, env, waitUntil) {
     const path = decodeURIComponent(new URL(request.url).pathname);
     try {
         const dir = path === '/' ? '' : path.substring(1, path.endsWith('/') ? path.length - 1 : path.length);
-        const contents = await fetchDirectoryContents(dir, env, request);
+        const contents = await fetchDirectoryContents(dir, env, request, waitUntil);
         const xml = generateWebDAVXml(path, contents);
         return new Response(xml, { status: 207, headers: { 'Content-Type': 'application/xml; charset=utf-8' } });
     } catch (error) {
@@ -243,7 +266,7 @@ async function handlePropfind(request, env) {
 
 // --- API DATA FETCHING ---
 
-async function fetchDirectoryContents(dir, env, request) {
+async function fetchDirectoryContents(dir, env, request, waitUntil) {
     let allFiles = [];
     let allDirectories = [];
     const count = -1; // Fetch all items
@@ -252,12 +275,18 @@ async function fetchDirectoryContents(dir, env, request) {
     listUrl.searchParams.set('dir', dir);
     listUrl.searchParams.set('count', count);
 
-    const response = await fetch(listUrl.toString(), { headers: await getApiHeaders(env) });
+    // 进程内调用 list 处理器，避免同域回环 522（list 处理器自身不鉴权，无需内部 token）
+    const response = await dispatchToFunction(listOnRequest, {
+        request: new Request(listUrl.toString()),
+        env,
+        waitUntil,
+        params: {},
+    });
     if (!response.ok) {
         const errorText = await response.text();
         throw new Error(`API fetch error: Status ${response.status} - ${errorText}`);
     }
-    
+
     const result = await response.json();
     if (result.error) {
         throw new Error(`API error: ${result.error} - ${result.message}`);
